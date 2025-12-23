@@ -1,0 +1,5 @@
+# 忽略视频和输出文件夹的内容，但保留文件夹本身
+视频/*
+!视频/.gitkeep
+output_ppts/*
+!output_ppts/.gitkeep
