@@ -6,7 +6,7 @@ import tempfile
 import shutil
 from pptx import Presentation
 from pptx.util import Inches
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, as_completed
 import threading
 
 # 创建线程锁用于保护打印输出
@@ -355,27 +355,28 @@ def extract_slides_dual_stream(video_path, output_base_dir,
                                group_a_motion_threshold=1.5,  # 运动阈值：检测显著变化（翻页动作）
                                group_a_min_duration=0.6,      # 静止时长（秒）：画面稳定后保存
                                group_a_quality=100,          # 原始画质保存（JPEG质量 1-100）
-                               # Group B 参数（低精度去重组）
+                               # Group B 参数（可读精简版）
                                group_b_motion_threshold=1.5,  # 运动阈值：低于此值认为内容未变化
-                               group_b_hash_threshold=5,      # 深度去重阈值：汉明距离小于此值认为重复
-                               group_b_scale_factor=0.7,      # 分辨率缩放因子（0.7表示缩放到70%）
-                               group_b_quality=75,            # JPEG压缩质量（降低文件体积）
+                               group_b_hash_threshold=8,      # 深度去重阈值：汉明距离小于此值认为重复（调高以提升去重精度）
+                               group_b_scale_factor=0.85,     # 分辨率缩放因子（0.85表示缩放到85%，确保文字清晰）
+                               group_b_quality=85,            # JPEG压缩质量（提升至85，确保可读性）
                                # 通用参数
                                use_morphology=True,
                                ignore_bottom_ratio=0.0,
                                ignore_right_ratio=0.0):
     """
-    双流（Dual-Stream）采集模块
+    双流（Dual-Stream）采集模块 - 优化版
     
     Group A: 高精度全量组 (Full-Fidelity Archive)
     - 智能触发：检测到显著变化后，一旦稳定就保存
     - 不去重，原始画质保存（保留所有捕获的帧）
     - 直接生成PPT文件
     
-    Group B: 低精度去重组 (Optimized Summary)
-    - 深度去重：即使时间戳在变，如果核心内容没变化就跳过
-    - 降低分辨率或增加压缩比，减小文件体积
-    - 直接生成PPT文件
+    Group B: 可读精简版 (Readable Summary)
+    - 深度去重：时间戳屏蔽 + 智能去重，确保只保存内容变化
+    - 高质量保存：85%分辨率 + 85%质量，确保文字清晰可读
+    - 性能优化：分析与解码分离，跳跃式采样
+    - 直接生成PPT文件，并二次合并相似图片
     """
     # 创建临时文件夹用于存储图片
     temp_dir = tempfile.mkdtemp()
@@ -408,33 +409,76 @@ def extract_slides_dual_stream(video_path, output_base_dir,
         
         # 采样处理间隔：每0.2秒检测一次画面状态（平衡性能与精度）
         process_interval = 0.2
-        frame_step = max(1, int(fps * process_interval))
+        base_frame_step = max(1, int(fps * process_interval))
         
         # Group A: 计算需要连续静止多少次循环才算"稳定"
         frames_needed_for_stable = max(1, int(group_a_min_duration / process_interval))
         
-        # Group B: 使用相同的间隔进行检测
+        # Group B: 使用相同的间隔进行检测，支持动态跳跃
         group_b_interval = 0.2
-        group_b_frame_step = max(1, int(fps * group_b_interval))
+        group_b_base_step = max(1, int(fps * group_b_interval))
+        
+        # 性能优化：分析用小尺寸图（256px宽度）
+        analysis_width = 256
         
         # Group A 变量（智能触发状态机）
         group_a_images = []  # 存储图片路径列表
         group_a_count = 0
-        group_a_last_gray = None
+        group_a_last_gray_small = None  # 小尺寸图用于分析
         group_a_stable_counter = 0
         group_a_pending_capture = False
         
         # Group B 变量
         group_b_images = []  # 存储图片路径列表
         group_b_count = 0
-        last_group_b_gray = None
+        last_group_b_gray_small = None  # 小尺寸图用于分析
         last_group_b_hash = None
+        group_b_stable_counter = 0  # 用于跳跃式采样
+        group_b_frame_step = group_b_base_step  # 动态调整
         
         frame_idx = 0
         
+        def preprocess_for_analysis(frame_full):
+            """预处理用于分析的图像（小尺寸，高性能）"""
+            gray = cv2.cvtColor(frame_full, cv2.COLOR_BGR2GRAY)
+            h, w = gray.shape
+            
+            # 缩放到小尺寸用于分析
+            scale = analysis_width / w
+            small_w = analysis_width
+            small_h = int(h * scale)
+            gray_small = cv2.resize(gray, (small_w, small_h))
+            
+            # ROI提取
+            roi_top = 0
+            roi_bottom = int(small_h * (1 - ignore_bottom_ratio))
+            roi_left = 0
+            roi_right = int(small_w * (1 - ignore_right_ratio))
+            gray_roi = gray_small[roi_top:roi_bottom, roi_left:roi_right]
+            
+            # 高斯模糊去噪
+            gray_roi = cv2.GaussianBlur(gray_roi, (5, 5), 0)  # 小核，因为图已经很小了
+            
+            if use_morphology:
+                kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+                gray_roi = cv2.morphologyEx(gray_roi, cv2.MORPH_OPEN, kernel)
+            
+            gray_processed = gray_small.copy()
+            gray_processed[roi_top:roi_bottom, roi_left:roi_right] = gray_roi
+            
+            return gray_processed, gray, h, w
+        
+        def mask_timestamp_for_hash(gray_img):
+            """时间戳屏蔽：抹除底部5%区域，避免时间戳干扰去重"""
+            h, w = gray_img.shape
+            mask_height = int(h * 0.05)  # 底部5%
+            masked = gray_img.copy()
+            masked[h - mask_height:, :] = 0  # 抹除底部区域
+            return masked
+        
         while True:
             # 快进读取（跳过中间帧，只读关键时间点）
-            for _ in range(frame_step):
+            for _ in range(base_frame_step):
                 cap.grab()
             
             ret, frame = cap.read()
@@ -444,38 +488,24 @@ def extract_slides_dual_stream(video_path, output_base_dir,
             current_time_ms = cap.get(cv2.CAP_PROP_POS_MSEC)
             current_time_sec = current_time_ms / 1000.0
             
-            # 图像预处理（ROI + 高斯模糊 + 形态学）
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            h, w = gray.shape
-            roi_top = 0
-            roi_bottom = int(h * (1 - ignore_bottom_ratio))
-            roi_left = 0
-            roi_right = int(w * (1 - ignore_right_ratio))
-            gray_roi = gray[roi_top:roi_bottom, roi_left:roi_right]
-            gray_roi = cv2.GaussianBlur(gray_roi, (21, 21), 0)
-            
-            if use_morphology:
-                kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
-                gray_roi = cv2.morphologyEx(gray_roi, cv2.MORPH_OPEN, kernel)
-            
-            gray_processed = gray.copy()
-            gray_processed[roi_top:roi_bottom, roi_left:roi_right] = gray_roi
+            # 性能优化：分析与解码分离 - 用小尺寸图进行分析
+            gray_small_processed, gray_full, h, w = preprocess_for_analysis(frame)
             
             # ========== Group A: 高精度全量组 ==========
             # 智能触发：检测到显著变化后，一旦稳定就保存（不去重）
-            if group_a_last_gray is None:
-                # 第一帧：直接保存并初始化
+            if group_a_last_gray_small is None:
+                # 第一帧：直接保存并初始化（使用完整尺寸图）
                 img_path = os.path.join(group_a_temp_dir, f"frame_{group_a_count:06d}.jpg")
                 cv2.imwrite(img_path, frame, [cv2.IMWRITE_JPEG_QUALITY, group_a_quality])
                 group_a_images.append(img_path)
                 group_a_count += 1
                 
-                group_a_last_gray = gray_processed
+                group_a_last_gray_small = gray_small_processed
                 group_a_pending_capture = True
                 group_a_stable_counter = 0
             else:
-                # 计算运动分数
-                motion_score = calculate_robust_motion_score(group_a_last_gray, gray_processed)
+                # 使用小尺寸图计算运动分数（性能优化）
+                motion_score = calculate_robust_motion_score(group_a_last_gray_small, gray_small_processed)
                 
                 # 检测显著变化（翻页动作）
                 significant_change = motion_score >= group_a_motion_threshold * 2
@@ -489,16 +519,15 @@ def extract_slides_dual_stream(video_path, output_base_dir,
                     # 画面相对稳定
                     if group_a_pending_capture:
                         group_a_stable_counter += 1
-                        # 一旦稳定了足够时间就捕获
+                        # 一旦稳定了足够时间就捕获（使用完整尺寸图）
                         if group_a_stable_counter >= frames_needed_for_stable:
-                            # 保存（不去重，保留所有捕获的帧）
                             img_path = os.path.join(group_a_temp_dir, f"frame_{group_a_count:06d}.jpg")
                             cv2.imwrite(img_path, frame, [cv2.IMWRITE_JPEG_QUALITY, group_a_quality])
                             group_a_images.append(img_path)
                             group_a_count += 1
                             
                             # 更新基准并重置状态
-                            group_a_last_gray = gray_processed
+                            group_a_last_gray_small = gray_small_processed
                             group_a_pending_capture = False
                             group_a_stable_counter = 0
                             
@@ -512,15 +541,17 @@ def extract_slides_dual_stream(video_path, output_base_dir,
                     else:
                         group_a_stable_counter = 0
             
-            # ========== Group B: 低精度去重组 ==========
-            # 只在特定间隔检测（节省计算）
+            # ========== Group B: 可读精简版 ==========
+            # 跳跃式采样：只在特定间隔检测（节省计算）
             if frame_idx % group_b_frame_step == 0:
-                if last_group_b_gray is None:
+                if last_group_b_gray_small is None:
                     # 第一帧：保存并初始化
-                    last_group_b_gray = gray_processed
-                    last_group_b_hash = dhash(gray_processed)
+                    last_group_b_gray_small = gray_small_processed
+                    # 时间戳屏蔽后计算哈希
+                    gray_masked = mask_timestamp_for_hash(gray_small_processed)
+                    last_group_b_hash = dhash(gray_masked)
                     
-                    # 保存第一帧（低精度）
+                    # 保存第一帧（高质量）
                     img_path = os.path.join(group_b_temp_dir, f"frame_{group_b_count:06d}.jpg")
                     frame_resized = cv2.resize(frame, 
                                              (int(w * group_b_scale_factor), 
@@ -529,10 +560,14 @@ def extract_slides_dual_stream(video_path, output_base_dir,
                               [cv2.IMWRITE_JPEG_QUALITY, group_b_quality])
                     group_b_images.append(img_path)
                     group_b_count += 1
+                    group_b_stable_counter = 0
                 else:
-                    # 计算运动分数和哈希值
-                    motion_score = calculate_robust_motion_score(last_group_b_gray, gray_processed)
-                    curr_hash = dhash(gray_processed)
+                    # 使用小尺寸图计算运动分数（性能优化）
+                    motion_score = calculate_robust_motion_score(last_group_b_gray_small, gray_small_processed)
+                    
+                    # 时间戳屏蔽后计算哈希（避免时间戳干扰）
+                    gray_masked = mask_timestamp_for_hash(gray_small_processed)
+                    curr_hash = dhash(gray_masked)
                     
                     # 深度去重判断
                     hamming_dist = hamming_distance(curr_hash, last_group_b_hash) if last_group_b_hash else 999
@@ -542,10 +577,10 @@ def extract_slides_dual_stream(video_path, output_base_dir,
                                      hamming_dist >= group_b_hash_threshold)
                     
                     if content_changed:
-                        # 内容有实质变化，保存
+                        # 内容有实质变化，保存（使用完整尺寸图）
                         img_path = os.path.join(group_b_temp_dir, f"frame_{group_b_count:06d}.jpg")
                         
-                        # 降低分辨率并压缩
+                        # 高质量保存（85%分辨率 + 85%质量）
                         frame_resized = cv2.resize(frame, 
                                                  (int(w * group_b_scale_factor), 
                                                   int(h * group_b_scale_factor)))
@@ -554,34 +589,75 @@ def extract_slides_dual_stream(video_path, output_base_dir,
                         group_b_images.append(img_path)
                         
                         # 更新基准
-                        last_group_b_gray = gray_processed
+                        last_group_b_gray_small = gray_small_processed
                         last_group_b_hash = curr_hash
                         group_b_count += 1
+                        group_b_stable_counter = 0
+                        group_b_frame_step = group_b_base_step  # 重置为基准步长
                         
                         with print_lock:
                             print(f"【Group B】捕获第 {group_b_count} 张 (时间: {current_time_sec:.1f}秒, "
                                 f"motion={motion_score:.2f}%, hamming={hamming_dist})")
+                    else:
+                        # 画面稳定，增加跳跃步长（性能优化）
+                        group_b_stable_counter += 1
+                        if group_b_stable_counter >= 3:  # 连续3次稳定，增加跳跃
+                            group_b_frame_step = min(group_b_base_step * 2, int(fps * 0.5))  # 最多0.5秒一跳
             
             frame_idx += 1
         
         cap.release()
         
         # 生成PPT文件
-        def create_ppt_from_images(images, output_ppt_path, group_name):
-            """从图片列表生成PPT"""
+        def create_ppt_from_images(images, output_ppt_path, group_name, merge_similar=False):
+            """从图片列表生成PPT
+            
+            Args:
+                images: 图片路径列表
+                output_ppt_path: 输出PPT路径
+                group_name: 组名称
+                merge_similar: 是否合并相似图片（Group B二次合并）
+            """
             if not images:
                 with print_lock:
                     print(f"【{group_name}】未提取到任何图片，跳过PPT生成")
                 return
             
+            # Group B二次合并：如果连续三张相似度极高，则合并
+            final_images = images.copy()
+            if merge_similar and len(images) >= 3:
+                filtered_images = [images[0]]  # 保留第一张
+                for i in range(1, len(images)):
+                    # 检查连续三张是否相似
+                    if i >= 2:
+                        prev_img = cv2.imread(images[i-2], cv2.IMREAD_GRAYSCALE)
+                        curr_img = cv2.imread(images[i], cv2.IMREAD_GRAYSCALE)
+                        
+                        if prev_img is not None and curr_img is not None:
+                            prev_hash = dhash(prev_img)
+                            curr_hash = dhash(curr_img)
+                            hamming_dist = hamming_distance(prev_hash, curr_hash)
+                            
+                            # 如果连续三张相似度极高（汉明距离<3），跳过中间一张
+                            if hamming_dist < 3:
+                                # 跳过当前图片（与上一张太相似）
+                                continue
+                    
+                    filtered_images.append(images[i])
+                
+                final_images = filtered_images
+                if len(final_images) < len(images):
+                    with print_lock:
+                        print(f"【{group_name}】二次合并：{len(images)} 张 -> {len(final_images)} 张")
+            
             with print_lock:
-                print(f"【{group_name}】共提取 {len(images)} 张图片，开始生成PPT...")
+                print(f"【{group_name}】共 {len(final_images)} 张图片，开始生成PPT...")
             
             prs = Presentation()
             prs.slide_width = Inches(10)
             prs.slide_height = Inches(7.5)
             
-            for i, img_path in enumerate(images):
+            for i, img_path in enumerate(final_images):
                 blank_slide_layout = prs.slide_layouts[6]
                 slide = prs.slides.add_slide(blank_slide_layout)
                 
@@ -611,23 +687,23 @@ def extract_slides_dual_stream(video_path, output_base_dir,
                 slide.shapes.add_picture(img_path, left, top, width, height)
                 if (i+1) % 10 == 0:
                     with print_lock:
-                        print(f"【{group_name}】已处理 {i+1}/{len(images)} 张...")
+                        print(f"【{group_name}】已处理 {i+1}/{len(final_images)} 张...")
             
             prs.save(output_ppt_path)
             with print_lock:
                 print(f"【{group_name}】PPT已保存: {output_ppt_path}")
         
-        # 生成Group A PPT
-        create_ppt_from_images(group_a_images, group_a_ppt, "Group A (高精度全量)")
+        # 生成Group A PPT（不去重）
+        create_ppt_from_images(group_a_images, group_a_ppt, "Group A (高精度全量)", merge_similar=False)
         
-        # 生成Group B PPT
-        create_ppt_from_images(group_b_images, group_b_ppt, "Group B (低精度去重)")
+        # 生成Group B PPT（二次合并相似图片）
+        create_ppt_from_images(group_b_images, group_b_ppt, "Group B (可读精简)", merge_similar=True)
         
         with print_lock:
             print(f"\n{'='*60}")
             print(f"双流采集完成: {os.path.basename(video_path)}")
             print(f"Group A (高精度全量): {group_a_count} 张 -> {group_a_ppt}")
-            print(f"Group B (低精度去重): {group_b_count} 张 -> {group_b_ppt}")
+            print(f"Group B (可读精简): {group_b_count} 张 -> {group_b_ppt}")
             print(f"{'='*60}\n")
     
     except Exception as e:
@@ -678,86 +754,83 @@ for file in os.listdir(video_dir):
         video_path = os.path.join(video_dir, file)
         video_files.append(video_path)
 
-if not video_files:
-    print(f"错误：在目录 {video_dir} 中未找到任何视频文件")
-    print(f"支持的格式: {', '.join(VIDEO_EXTENSIONS)}")
-else:
-    print(f"找到 {len(video_files)} 个视频文件，开始双流采集处理...\n")
+# 处理单个视频的包装函数（移到模块级别，支持多进程）
+def process_video(video_file, idx, total, output_dir):
+    video_name = os.path.basename(video_file)
+    video_name_no_ext = os.path.splitext(video_name)[0]
     
-    # 处理单个视频的包装函数
-    def process_video(video_file, idx, total):
-        video_name = os.path.basename(video_file)
-        video_name_no_ext = os.path.splitext(video_name)[0]
+    with print_lock:
+        print(f"\n{'='*60}")
+        print(f"进程开始处理 [{idx}/{total}]: {video_name}")
+        print(f"{'='*60}")
+    
+    try:
+        # 双流采集模式
+        extract_slides_dual_stream(
+            video_file,
+            output_dir,
+            # Group A 参数（高精度全量组）
+            group_a_motion_threshold=1.5,  # 运动阈值：检测显著变化
+            group_a_min_duration=0.6,      # 静止时长：画面稳定后保存（0.5-0.8推荐）
+            group_a_quality=100,            # 原始画质保存
+            # Group B 参数（可读精简版）
+            group_b_motion_threshold=1.5,  # 运动阈值
+            group_b_hash_threshold=8,       # 深度去重阈值（调高以提升去重精度）
+            group_b_scale_factor=0.85,      # 分辨率缩放（85%，确保文字清晰）
+            group_b_quality=85,             # JPEG压缩质量（提升至85，确保可读性）
+            # 通用参数
+            use_morphology=True,
+            ignore_bottom_ratio=0.0,
+            ignore_right_ratio=0.0
+        )
         
         with print_lock:
-            print(f"\n{'='*60}")
-            print(f"线程开始处理 [{idx}/{total}]: {video_name}")
-            print(f"{'='*60}")
+            print(f"✓ 完成 [{idx}/{total}]: {video_name}")
+        return True, video_name
+    except Exception as e:
+        with print_lock:
+            print(f"✗ 失败 [{idx}/{total}]: {video_name} - 错误: {str(e)}")
+        return False, video_name
+
+if __name__ == '__main__':
+    if not video_files:
+        print(f"错误：在目录 {video_dir} 中未找到任何视频文件")
+        print(f"支持的格式: {', '.join(VIDEO_EXTENSIONS)}")
+    else:
+        print(f"找到 {len(video_files)} 个视频文件，开始双流采集处理...\n")
         
-        try:
-            # 双流采集模式
-            extract_slides_dual_stream(
-                video_file,
-                output_dir,
-                # Group A 参数（高精度全量组）
-                group_a_motion_threshold=1.5,  # 运动阈值：检测显著变化
-                group_a_min_duration=0.6,      # 静止时长：画面稳定后保存（0.5-0.8推荐）
-                group_a_quality=100,            # 原始画质保存
-                # Group B 参数（低精度去重组）
-                group_b_motion_threshold=1.5,  # 运动阈值
-                group_b_hash_threshold=5,       # 深度去重阈值
-                group_b_scale_factor=0.7,       # 分辨率缩放（70%）
-                group_b_quality=75,              # JPEG压缩质量
-                # 通用参数
-                use_morphology=True,
-                ignore_bottom_ratio=0.0,
-                ignore_right_ratio=0.0
-            )
+        # 使用多进程处理（进程数设置为CPU核心数，但不超过视频文件数量）
+        # 注意：多进程可以充分利用多核CPU，突破Python GIL限制
+        import multiprocessing
+        max_workers = min(multiprocessing.cpu_count(), len(video_files))
+        print(f"使用 {max_workers} 个进程并行处理...\n")
+        
+        # 使用进程池执行（性能优化：突破GIL限制）
+        completed = 0
+        failed = 0
+        with ProcessPoolExecutor(max_workers=max_workers) as executor:
+            # 提交所有任务
+            future_to_video = {
+                executor.submit(process_video, video_file, idx, len(video_files), output_dir): (idx, video_file)
+                for idx, video_file in enumerate(video_files, 1)
+            }
             
-            with print_lock:
-                print(f"✓ 完成 [{idx}/{total}]: {video_name}")
-            return True, video_name
-        except Exception as e:
-            with print_lock:
-                print(f"✗ 失败 [{idx}/{total}]: {video_name} - 错误: {str(e)}")
-            return False, video_name
-    
-    # 使用多线程处理（线程数设置为CPU核心数，但不超过视频文件数量）
-    import multiprocessing
-    max_workers = min(multiprocessing.cpu_count(), len(video_files))
-    print(f"使用 {max_workers} 个线程并行处理...\n")
-    
-    # 创建任务列表
-    tasks = []
-    for idx, video_file in enumerate(video_files, 1):
-        tasks.append((video_file, idx, len(video_files)))
-    
-    # 使用线程池执行
-    completed = 0
-    failed = 0
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        # 提交所有任务
-        future_to_video = {
-            executor.submit(process_video, video_file, idx, len(video_files)): (idx, video_file)
-            for idx, video_file in enumerate(video_files, 1)
-        }
-        
-        # 等待所有任务完成
-        for future in as_completed(future_to_video):
-            idx, video_file = future_to_video[future]
-            try:
-                success, video_name = future.result()
-                if success:
-                    completed += 1
-                else:
+            # 等待所有任务完成
+            for future in as_completed(future_to_video):
+                idx, video_file = future_to_video[future]
+                try:
+                    success, video_name = future.result()
+                    if success:
+                        completed += 1
+                    else:
+                        failed += 1
+                except Exception as e:
+                    with print_lock:
+                        print(f"✗ 异常 [{idx}/{len(video_files)}]: {os.path.basename(video_file)} - {str(e)}")
                     failed += 1
-            except Exception as e:
-                with print_lock:
-                    print(f"✗ 异常 [{idx}/{len(video_files)}]: {os.path.basename(video_file)} - {str(e)}")
-                failed += 1
-    
-    print(f"\n{'='*60}")
-    print(f"批量处理完成！")
-    print(f"成功: {completed} 个，失败: {failed} 个")
-    print(f"所有PPT已保存至: {output_dir}")
-    print(f"{'='*60}")
+        
+        print(f"\n{'='*60}")
+        print(f"批量处理完成！")
+        print(f"成功: {completed} 个，失败: {failed} 个")
+        print(f"所有PPT已保存至: {output_dir}")
+        print(f"{'='*60}")
